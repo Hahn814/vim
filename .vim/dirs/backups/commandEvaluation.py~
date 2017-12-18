@@ -1,0 +1,316 @@
+"""
+    09/08
+    commandEvaluation.py
+    Created by Paul Hahn
+    08/28/17
+
+    Troubleshoot timeout causation in general and specific use cases.
+"""
+# Environment imports
+# CDS and environment imports
+from base.env import Env
+from com.mmodal.cds import Environment, ObjectId, ObjectIdTools
+from com.mmodal.cds.util import InternalObjectIdTools
+from com.mmodal.cds.service.vocab import CodedValueTools
+
+# Utilities
+from utils.argutils import printArgs, getOids
+from java.util import Date
+
+# General
+import argparse
+import re
+from java.util import Calendar
+from java.text import SimpleDateFormat
+
+# Field types
+from com.mmodal.cds.interactive import DictationField
+from com.mmodal.cds.interactive import GrammarField
+from com.mmodal.cds.interactive import TextSelectionField
+
+
+class ReverseCommandArbiter(object):
+    """
+        A class to hold all of the functions specific to reverse engineering the command arbitration
+    """
+    def __init__(self):
+        # Blocks are what I am calling the recognition sequences ~ decoding loops
+        self.isls = []
+
+    def get_recognition_blocks(self, isl_str, cr):
+        """
+        A function to extract the field type, token, and timing metrics of an ISL and add it to our collection
+        :param isl_obj: ISL object
+        :return: recognition blocks related to this ISL
+        """
+        recognition_blocks = []
+        # Get Interactive Session Log and author specs
+        isl_svc = Env.get_service("InteractiveSessionLog", isl_str)
+        isl_obj = isl_svc.getSessionLog(isl_str)
+        author_oid_obj = ObjectIdTools.construct(isl_obj.getSpeakerId())
+
+        # Get call logs
+        print("Collecting recognition result alternatives..")
+        for call_log in isl_obj.getCallLogs():
+            if call_log and call_log.getResult():
+                for result in call_log.getResult().getResults():
+                    result_id = result.getResultId()
+
+                    for ra in result.getResultAlternatives():
+                        field_type = ra.getFieldType()
+                        tokens = ra.getTokens()
+
+                        summary = {"Result Id": result_id, "Tokens": [], "Field Type": None}
+                        for token in tokens:
+                            text = str(token.getText()).strip()
+                            st = token.getStartTime()
+                            et = token.getEndTime()
+                            timing = (st, et)
+                            command_id = token.getCommandId()
+
+                            if text:
+                                # print("Text: " + str(text))
+                                # print("Timing: " + str(timing))
+                                # print("Command id: " + str(command_id))
+                                # print("Field type: " + str(field_type))
+
+                                summary["Tokens"].append((text, timing))
+                                summary["Field Type"] = field_type
+                        ts = [t for t, timings in summary["Tokens"]]
+                        if ts:
+                            token_str = " ".join(ts)
+                            if summary["Field Type"] and cr.search(token_str):
+                                recognition_blocks.append(summary)
+
+        return recognition_blocks
+
+    def evaluate_commands(self, recognition_blocks):
+
+        state_dict = {"TIMEOUT": [], "PASSED": [], "DICTATION": []}
+        processed = -1
+        states = []
+        for position, summary in enumerate(recognition_blocks):
+            field_type = summary["Field Type"]
+            result_id = summary["Result Id"]
+            tokens = summary["Tokens"]
+
+            states.append((result_id, field_type, tokens))
+
+            # We reached a conclusion on the block
+            if summary["Field Type"] != "PARTIAL":
+                #states = sorted(states, key=lambda tup: tup[0])
+                if summary["Field Type"] == "DICTATION":
+                    # grammar failed, parsed to DICTATION, something happened that changed the context
+                    state_dict["DICTATION"].append(states)
+                elif summary["Field Type"] == "INCOMPLETE":
+                    # Grammar failed, final timeout
+                    state_dict["TIMEOUT"].append(states)
+                elif re.search(r'GRAMMAR', summary["Field Type"]):
+                    # Grammar was recognized correctly after len(recognition_blocks[position:p]) states
+                    state_dict["PASSED"].append(states)
+                states = []
+
+
+            for key, value in state_dict.items():
+                if value:
+                    print(str(key))
+                    border = "_" * len(str(key))
+                    print(border)
+                    for states in value:
+                        if states:
+                            for rid, ft, tokens in states:
+                                print("\t| " + str(ft) + ", " + str(rid) + "\t" + str(tokens))
+                #
+                # print("Slice summary: " + str(indices))
+                # if len(indices) > 1:
+                #     for summary in recognition_blocks[int(min(indices)): int(max(indices))]:
+                #         print("Summary, result ID: " + str(summary["Result Id"]) + "\t" + str(summary["Field Type"]) + ":\t" + str(
+                #         summary["Tokens"]))
+                # else:
+                #     index = indices[0]
+                #     if index - 1 >= 0:
+                #         print("Summary, result ID: " + str(recognition_blocks[index-1]["Result Id"]) + "\t" + str(
+                #             recognition_blocks[index - 1]["Field Type"]) + ":\t" + str(
+                #             recognition_blocks[index - 1]["Tokens"]))
+                #
+                #     print("Summary, result ID: " + str(block["Result Id"]) + "\t" + str(
+                #         block["Field Type"]) + ":\t" + str(
+                #         block["Tokens"]))
+                #
+                #     if index + 1 <= len(recognition_blocks ) - 1:
+                #         print("Summary, result ID: " + str(recognition_blocks[index + 1]["Result Id"]) + "\t" + str(
+                #             recognition_blocks[index + 1]["Field Type"]) + ":\t" + str(
+                #             recognition_blocks[index + 1]["Tokens"]))
+                #
+
+
+
+
+    def get_sessions_evaulated(self):
+        return self.isls
+
+
+def get_session_logs_from_oid(author_oid, since, end_date):
+    """
+    Get session logs using OID and start/end dates
+    :param author_oid: Author OID
+    :param since: Start date
+    :param end_date: End date
+    :return: List of tuples (svc, channel, list of logs)
+    """
+    env = Env.get_env()
+    catalog = env.getCatalog()
+
+    channels = ['11025-hq']
+    sessions = []
+
+    channels = [CodedValueTools.construct(channel, "AudioQuality") for channel in channels]
+    for channel in channels:
+        for svc in catalog.listAllServicesBelow("InteractiveSessionLog", author_oid):
+            session_logs = Env.get_service("InteractiveSessionLog", svc).listSessionLogs(since, end_date, 255, 1, channel)
+            sessions += session_logs
+
+    return sessions
+
+
+def set_since(since, dateFormat):
+    if since == "yesterday":
+        cal = Calendar.getInstance()
+        cal.add(Calendar.DAY_OF_MONTH, -1)
+        cal.set(Calendar.HOUR_OF_DAY, 0)
+        cal.set(Calendar.MINUTE, 0)
+        cal.set(Calendar.SECOND, 0)
+        since = cal.getTime()
+    elif since[-5:] == "hours":
+        hoursN = int(since[:-5])
+        cal = Calendar.getInstance()
+        cal.add(Calendar.DAY_OF_MONTH, 0)
+        cal.set(Calendar.HOUR_OF_DAY, -hoursN)
+        cal.set(Calendar.MINUTE, 0)
+        cal.set(Calendar.SECOND, 0)
+        since = cal.getTime()
+    elif since[-4:] == "days":
+        daysN = int(since[:-4])
+        cal = Calendar.getInstance()
+        cal.add(Calendar.DAY_OF_MONTH, -daysN)
+        cal.set(Calendar.HOUR_OF_DAY, 0)
+        cal.set(Calendar.MINUTE, 0)
+        cal.set(Calendar.SECOND, 0)
+        since = cal.getTime()
+    elif since[-5:] == "weeks":
+        daysN = int(since[:-5]) * 7
+        cal = Calendar.getInstance()
+        cal.add(Calendar.DAY_OF_MONTH, -daysN)
+        cal.set(Calendar.HOUR_OF_DAY, 0)
+        cal.set(Calendar.MINUTE, 0)
+        cal.set(Calendar.SECOND, 0)
+        since = cal.getTime()
+    else:
+        sdf = SimpleDateFormat(dateFormat)
+        since = sdf.parse(since)
+    return since
+
+def set_endDate(endDate, dateFormat):
+    if endDate is None:
+        cal = Calendar.getInstance()
+        cal.add(Calendar.DAY_OF_MONTH, 0)
+        cal.add(Calendar.HOUR_OF_DAY, 0)
+        cal.add(Calendar.MINUTE, 0)
+        cal.add(Calendar.SECOND, 0)
+        endDate = cal.getTime()
+    else:
+        sdf = SimpleDateFormat(dateFormat)
+        endDate = sdf.parse(endDate)
+    return endDate
+
+def get_arg_parser():
+    """
+    Build the argument parser
+    :return: Parser object
+    """
+    parser = argparse.ArgumentParser()
+    # Object Id arguments
+    parser.add_argument("-L", "--loglist", default=None, help="List containing the ISLs to evaluate")
+    parser.add_argument('-i', '--oid', help='object id under which to retrieve ISL services')
+    parser.add_argument('-z', '--root', default=[], action='append', help='root of object ids under which to retrieve ISL services')
+    parser.add_argument('-l', '--oidlist', help='A list of object ids under which to retrieve ISL services')
+
+    # Script specifics
+    parser.add_argument('-r', '--commandregex', default='.+', help='Regular expression related to the field types we want to match')
+
+    # Date formatting
+    parser.add_argument('-d', '--dateformat', default='MM-dd-yyyy', help='Format used for parsing "since" argument')
+    parser.add_argument('-s', '--since', help='Look for SessionLogs created after this date')
+    parser.add_argument('-e', '--endDate', help='Look for SessionLogs created up to this date')
+    return parser
+
+def get_args():
+    """
+    Perform some input testing and initialize argument types
+    :return: Arg object containing formatted input arguments
+    """
+    parser = get_arg_parser()
+    args = get_arg_parser().parse_args()
+
+    if not (args.loglist or args.oid and args.since or args.root and args.since):
+        parser.error('must specify at least a list of sessions using --loglist <LOGFILE>')
+
+    if args.commandregex:
+        args.commandregex = re.compile(args.commandregex, re.IGNORECASE)
+        print("Field type regex compiled ~ \'" + str(args.commandregex.pattern) + "\'")
+
+    print(str(args))
+
+    return args
+
+if __name__ == '__main__':
+    args = get_args()
+    Env.init()
+
+    # get OIDs
+    print("Getting author object IDs...")
+    oids = getOids(args.oid, args.oidlist, args.root)
+
+    # Get time frame
+    if args.since:
+        start_date = set_since(args.since, args.dateformat)
+    end_date = set_endDate(args.endDate, args.dateformat)
+
+    Env.init()
+
+    logs = []
+    # Get session OIDs from specified source
+    if args.loglist:
+        log_list_in = open(args.loglist, 'rb')
+        for position, oid in enumerate(log_list_in):
+            try:
+                session_log_id = ObjectIdTools.construct(str(oid).strip())
+                logs.append(session_log_id)
+
+            except Exception, e:
+                print("Error constructing session log object from oid: " + str(oid) + ", line: " + str(
+                    position) + ", file: " + str(log_list_in))
+    else:
+        for oid in oids:
+            # Get the logs the good ole fashion way
+            sessions = get_session_logs_from_oid(oid, start_date, end_date)
+            logs += sessions
+
+    rca = ReverseCommandArbiter()
+    log_count = len(logs)
+    cr = args.commandregex
+    for position, isl_str in enumerate(logs):
+        print("Evaluating log " + str(position) + "/" + str(log_count) + ": " + str(isl_str))
+
+        # Get recognition blocks
+        recognition_blocks = rca.get_recognition_blocks(isl_str, cr)
+        rca.evaluate_commands(recognition_blocks)
+
+    print(rca.get_sessions_evaulated())
+
+
+    # get session logs
+    # for each session log
+    #     get recognition blocks
+    #     for each block
+    #         evaluate block
